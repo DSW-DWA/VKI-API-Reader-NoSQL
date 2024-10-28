@@ -73,18 +73,61 @@ class Neo4jDatabase:
         MATCH (a:User {{id: {from_user}}}), (b:Group {{id: {to_group}}})
         MERGE (a)-[:{rel_type}]->(b)
         """
-
         tx.run(query, from_user=from_user, to_group=to_group)
 
+    # Методы для выполнения запросов
+    def count_users(self):
+        with self.driver.session() as session:
+            result = session.run("MATCH (u:User) RETURN count(u) AS total_users")
+            return result.single()["total_users"]
+
+    def count_groups(self):
+        with self.driver.session() as session:
+            result = session.run("MATCH (g:Group) RETURN count(g) AS total_groups")
+            return result.single()["total_groups"]
+
+    def top_users_by_followers(self, limit=5):
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (u:User)<-[:Follow]-(follower:User)
+                RETURN u.id AS user_id, u.name AS name, count(follower) AS followers_count
+                ORDER BY followers_count DESC
+                LIMIT $limit
+                """, limit=limit)
+            return result.values()
+
+    def top_groups_by_subscribers(self, limit=5):
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (g:Group)<-[:Subscribe]-(user:User)
+                RETURN g.id AS group_id, g.name AS name, count(user) AS subscribers_count
+                ORDER BY subscribers_count DESC
+                LIMIT $limit
+                """, limit=limit)
+            return result.values()
+
+    def mutual_followers(self):
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (u:User)-[:Follow]->(v:User), (v)-[:Follow]->(u)
+                RETURN u.id AS user1_id, v.id AS user2_id
+                """
+            )
+            return result.values()
+
+# VK API функции
 def get_user_info(user_id, token):
     url = f"https://api.vk.com/method/users.get?user_ids={user_id}&fields=followers_count,counters,city,screen_name,sex,home_town&access_token={token}&v=5.131"
     user_data = requests.get(url).json().get('response', [{}])[0]
     return {
-            "id": user_data.get("id"),
-            "screen_name": user_data.get("screen_name"),
-            "name": f"{user_data.get('first_name')} {user_data.get('last_name')}",
-            "sex": user_data.get("sex"),
-            "home_town": user_data.get("city", {}).get("title", "")
+        "id": user_data.get("id"),
+        "screen_name": user_data.get("screen_name"),
+        "name": f"{user_data.get('first_name')} {user_data.get('last_name')}",
+        "sex": user_data.get("sex"),
+        "home_town": user_data.get("city", {}).get("title", "")
     }
 
 def get_followers(user_id, token):
@@ -159,26 +202,47 @@ def save_data_to_neo4j(db, data, token):
             db.add_group(group_data)
             db.add_relationship_sub(user_id, group_id, "Subscribe")
 
-def main(user_id, output_path, token):
-    data = collect_followers_and_subscriptions(user_id, token, depth=1)
+def main(args, token):
+    db = Neo4jDatabase(uri="Подключение к вашей бд", user="neo4j", password="Пароль от вашей бд")
     
-    save_to_json(data, output_path)
-    print(f"Данные сохранены в файл {output_path}")
+    if args.query == "count_users":
+        print("Total users:", db.count_users())
+    elif args.query == "count_groups":
+        print("Total groups:", db.count_groups())
+    elif args.query == "top_users":
+        top_users = db.top_users_by_followers(limit=5)
+        print("Top 5 users by followers:")
+        for user_id, name, followers_count in top_users:
+            print(f"ID: {user_id}, Name: {name}, Followers: {followers_count}")
+    elif args.query == "top_groups":
+        top_groups = db.top_groups_by_subscribers(limit=5)
+        print("Top 5 groups by subscribers:")
+        for group_id, name, subscribers_count in top_groups:
+            print(f"ID: {group_id}, Name: {name}, Subscribers: {subscribers_count}")
+    elif args.query == "mutual_followers":
+        mutual = db.mutual_followers()
+        print("Users who follow each other:")
+        for user1_id, user2_id in mutual:
+            print(f"User {user1_id} <-> User {user2_id}")
+    else:
+        data = collect_followers_and_subscriptions(args.user_id, token, depth=1)
+        save_to_json(data, args.output)
+        print(f"Data saved to {args.output}")
+        try:
+            save_data_to_neo4j(db, data, token)
+            logger.info("Data successfully saved to Neo4j database")
+        except Exception as e:
+            logger.error(f"Error saving to Neo4j: {e}")
     
-    db = Neo4jDatabase(uri="Ссылка на вашу бд", user="neo4j", password="Пароль от вашей бд")
-    try:
-        save_data_to_neo4j(db, data, token)
-        logger.info("Данные успешно сохранены в базу данных Neo4j")
-    except Exception as e:
-        logger.error(f"Ошибка сохранения в Neo4j: {e}")
-    finally:
-        db.close()
+    db.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VK Data Collector with Neo4j")
-    parser.add_argument('--user_id', type=str, default='303214441', help="VK user ID (default is your user ID)")
+    parser.add_argument('--user_id', type=str, default='303214441', help="VK user ID")
     parser.add_argument('--output', type=str, default='vk_data.json', help="Output JSON file path")
+    parser.add_argument('--query', type=str, choices=['count_users', 'count_groups', 'top_users', 'top_groups', 'mutual_followers'],
+                        help="Query type for Neo4j database")
     args = parser.parse_args()
 
     token = 'Ваш токен VK'
-    main(args.user_id, args.output, token)
+    main(args, token)
